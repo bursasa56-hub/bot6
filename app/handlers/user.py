@@ -5,7 +5,13 @@ from html import escape
 
 from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, FSInputFile, Message
+from aiogram.types import (
+    CallbackQuery,
+    ChatMemberUpdated,
+    FSInputFile,
+    InputMediaPhoto,
+    Message,
+)
 
 from app import db, keyboards
 from app.downloader import (
@@ -42,15 +48,32 @@ async def require_subscriptions(message: Message) -> bool:
     return False
 
 
+def _is_group_chat(message: Message) -> bool:
+    return message.chat.type in {"group", "supergroup"}
+
+
+async def _save_chat(message: Message) -> None:
+    if _is_group_chat(message):
+        await db.upsert_group(message.chat.id, message.chat.title)
+    elif message.from_user:
+        await db.upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     user = message.from_user
     if user is None:
         return
-    await db.upsert_user(user.id, user.username, user.full_name)
+    await _save_chat(message)
+    bot_info = await message.bot.get_me()
     await message.answer(
-        "Привет! Пришли ссылку на видео из TikTok или YouTube — скачаю без водяного знака.",
+        "Привет! Пришли ссылку на видео из TikTok или YouTube — скачаю без водяного знака.\n\n"
+        "Меня можно добавить в группу кнопкой ниже.",
         reply_markup=keyboards.main_menu(user.id),
+    )
+    await message.answer(
+        "Добавить бота в группу:",
+        reply_markup=keyboards.add_to_group_keyboard(bot_info.username),
     )
     await require_subscriptions(message)
 
@@ -90,6 +113,18 @@ async def check_subs(callback: CallbackQuery) -> None:
     )
 
 
+@router.my_chat_member()
+async def my_chat_member(update: ChatMemberUpdated) -> None:
+    chat = update.chat
+    if chat.type not in {"group", "supergroup"}:
+        return
+    status = update.new_chat_member.status
+    if status in {"member", "administrator"}:
+        await db.upsert_group(chat.id, chat.title)
+    elif status in {"left", "kicked"}:
+        await db.remove_broadcast_chat(chat.id)
+
+
 @router.message(F.text)
 async def handle_link(message: Message) -> None:
     user = message.from_user
@@ -98,16 +133,18 @@ async def handle_link(message: Message) -> None:
     if message.text.startswith("/") or message.text in {"❓ Помощь", "⚙️ Админ-панель"}:
         return
 
-    await db.upsert_user(user.id, user.username, user.full_name)
-    if not await require_subscriptions(message):
-        return
+    await _save_chat(message)
 
     url = extract_url(message.text)
     if url is None:
-        await message.answer("Пришли ссылку на видео из TikTok или YouTube.")
+        if not _is_group_chat(message):
+            await message.answer("Пришли ссылку на видео из TikTok или YouTube.")
+        return
+    if not await require_subscriptions(message):
         return
     if not is_supported_url(url):
-        await message.answer("Пока умею скачивать только TikTok и YouTube.")
+        if not _is_group_chat(message):
+            await message.answer("Пока умею скачивать только TikTok и YouTube.")
         return
 
     async with busy_lock:
@@ -116,33 +153,42 @@ async def handle_link(message: Message) -> None:
             return
         busy_users.add(user.id)
 
-    status = await message.answer("Скачиваю видео, это может занять минуту…")
+    status = await message.answer("Скачиваю, это может занять минуту…")
     try:
-        video = await download_video(url)
-        caption = f"{video.source}: {escape(video.title)}"
-        filename = f"{video.source}.mp4"
+        result = await download_video(url)
         try:
-            try:
-                await message.answer_video(
-                    video=FSInputFile(video.path, filename=filename),
-                    caption=caption,
-                    supports_streaming=True,
-                )
-            except Exception:
-                await message.answer_document(
-                    document=FSInputFile(video.path, filename=filename),
-                    caption=caption,
-                )
+            if result.kind == "photos" and result.photos:
+                media = [
+                    InputMediaPhoto(media=FSInputFile(photo))
+                    for photo in result.photos[:10]
+                ]
+                if media:
+                    media[0].caption = f"{result.source}: {escape(result.title)}"
+                await message.answer_media_group(media=media)
+                await status.delete()
+            elif result.kind == "video" and result.path:
+                caption = f"{result.source}: {escape(result.title)}"
+                filename = f"{result.source}.mp4"
+                try:
+                    await message.answer_video(
+                        video=FSInputFile(result.path, filename=filename),
+                        caption=caption,
+                        supports_streaming=True,
+                    )
+                except Exception:
+                    await message.answer_document(
+                        document=FSInputFile(result.path, filename=filename),
+                        caption=caption,
+                    )
+                await status.delete()
+            else:
+                await status.edit_text("Не удалось получить контент по ссылке.")
         finally:
-            video.path.unlink(missing_ok=True)
-        try:
-            await status.delete()
-        except Exception:
-            pass
+            result.cleanup()
     except DownloadError as exc:
         await status.edit_text(str(exc))
     except Exception:
-        await status.edit_text("Не получилось отправить видео. Попробуй другую ссылку.")
+        await status.edit_text("Не получилось отправить контент. Попробуй другую ссылку.")
     finally:
         async with busy_lock:
             busy_users.discard(user.id)

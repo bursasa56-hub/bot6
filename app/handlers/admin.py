@@ -30,10 +30,12 @@ def admin_only(user_id: int | None) -> bool:
 
 async def show_panel(target: Message) -> None:
     count = await db.count_users()
+    groups = await db.count_groups()
     channels = await db.get_channels()
     await target.answer(
         "⚙️ <b>Админ-панель</b>\n\n"
         f"Пользователей: <b>{count}</b>\n"
+        f"Групп: <b>{groups}</b>\n"
         f"Обязательных подписок: <b>{len(channels)}</b>",
         reply_markup=keyboards.admin_panel_keyboard(),
     )
@@ -67,10 +69,11 @@ async def admin_stats(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     count = await db.count_users()
+    groups = await db.count_groups()
     channels = await db.get_channels()
     await callback.answer()
     await callback.message.answer(
-        f"📊 Пользователей: <b>{count}</b>\nОбязательных каналов: <b>{len(channels)}</b>"
+        f"📊 Пользователей: <b>{count}</b>\nГрупп: <b>{groups}</b>\nОбязательных каналов: <b>{len(channels)}</b>"
     )
 
 
@@ -221,8 +224,9 @@ async def broadcast_preview(message: Message, state: FSMContext) -> None:
     await state.update_data(from_chat=message.chat.id, message_id=message.message_id)
     await state.set_state(AdminStates.confirm_broadcast)
     users = await db.count_users()
+    groups = await db.count_groups()
     await message.answer(
-        f"Разослать этот пост <b>{users}</b> пользователям?",
+        f"Разослать этот пост <b>{users}</b> пользователям и <b>{groups}</b> группам?",
         reply_markup=keyboards.broadcast_confirm_keyboard(),
     )
 
@@ -235,17 +239,17 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
     await state.clear()
     await callback.answer("Рассылка запущена")
-    user_ids = await db.all_user_ids()
+    chat_ids = await db.all_broadcast_chats()
     ok = 0
     fail = 0
     from_chat = data["from_chat"]
     message_id = data["message_id"]
-    status = await callback.message.answer(f"Рассылаю… 0/{len(user_ids)}")
+    status = await callback.message.answer(f"Рассылаю… 0/{len(chat_ids)}")
 
-    for index, user_id in enumerate(user_ids, start=1):
+    for index, chat_id in enumerate(chat_ids, start=1):
         try:
             await callback.bot.copy_message(
-                chat_id=user_id,
+                chat_id=chat_id,
                 from_chat_id=from_chat,
                 message_id=message_id,
             )
@@ -254,7 +258,7 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext) -> None:
             await asyncio.sleep(exc.retry_after + 1)
             try:
                 await callback.bot.copy_message(
-                    chat_id=user_id,
+                    chat_id=chat_id,
                     from_chat_id=from_chat,
                     message_id=message_id,
                 )
@@ -264,11 +268,11 @@ async def broadcast_send(callback: CallbackQuery, state: FSMContext) -> None:
         except (TelegramForbiddenError, TelegramBadRequest):
             fail += 1
         except Exception:
-            log.exception("Broadcast failed for %s", user_id)
+            log.exception("Broadcast failed for %s", chat_id)
             fail += 1
         if index % 20 == 0:
             try:
-                await status.edit_text(f"Рассылаю… {index}/{len(user_ids)}")
+                await status.edit_text(f"Рассылаю… {index}/{len(chat_ids)}")
             except TelegramBadRequest:
                 pass
         await asyncio.sleep(0.05)

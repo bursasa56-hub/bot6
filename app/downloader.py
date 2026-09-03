@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import mimetypes
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+import aiohttp
 import yt_dlp
 
 from app.config import DOWNLOAD_DIR, TELEGRAM_MAX_BYTES
@@ -27,10 +29,18 @@ class DownloadError(Exception):
 
 
 @dataclass
-class DownloadedVideo:
-    path: Path
+class DownloadResult:
+    kind: str  # "video" | "photos"
     title: str
     source: str
+    path: Path | None = None
+    photos: list[Path] = field(default_factory=list)
+
+    def cleanup(self) -> None:
+        for photo in self.photos:
+            photo.unlink(missing_ok=True)
+        if self.path:
+            self.path.unlink(missing_ok=True)
 
 
 def extract_url(text: str) -> str | None:
@@ -82,10 +92,29 @@ def _ydl_opts(outtmpl: str) -> dict:
     }
 
 
-def _download_sync(url: str, dest_dir: Path) -> DownloadedVideo:
+def _find_photos(info: dict) -> list[str]:
+    """Собрать прямые ссылки на кадры TikTok-слайдшоу."""
+    candidates: list[str] = []
+    if isinstance(info.get("thumbnails"), list):
+        for thumb in info["thumbnails"]:
+            if thumb.get("url"):
+                candidates.append(thumb["url"])
+    if info.get("thumbnail"):
+        candidates.append(info["thumbnail"])
+
+    unique: list[str] = []
+    seen = set()
+    for url in candidates:
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(url)
+    return unique
+
+
+def _download_sync(url: str, dest_dir: Path) -> DownloadResult:
     dest_dir.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(dest_dir / f"{uuid.uuid4().hex}.%(ext)s")
-    opts = _ydl_opts(outtmpl)
+    job_id = uuid.uuid4().hex
+    opts = _ydl_opts(str(dest_dir / f"{job_id}.%(ext)s"))
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
@@ -101,39 +130,60 @@ def _download_sync(url: str, dest_dir: Path) -> DownloadedVideo:
     except yt_dlp.utils.DownloadError as exc:
         raise DownloadError(_human_error(str(exc))) from exc
 
+    title = (info.get("title") or "video").strip() or "video"
+    source = _source_name(url)
+
     path = Path(filename)
     if not path.exists():
         mp4 = path.with_suffix(".mp4")
         if mp4.exists():
             path = mp4
-        else:
-            raise DownloadError("Файл после скачивания не найден.")
 
-    size = path.stat().st_size
-    if size <= 0:
-        path.unlink(missing_ok=True)
-        raise DownloadError("Получен пустой файл.")
-    if size > TELEGRAM_MAX_BYTES:
-        path.unlink(missing_ok=True)
-        raise DownloadError(
-            "Видео слишком большое для Telegram (лимит бота — 50 МБ). "
-            "Попробуйте другое видео или более короткое."
-        )
+    if path.exists() and path.stat().st_size > 0:
+        size = path.stat().st_size
+        if size > TELEGRAM_MAX_BYTES:
+            path.unlink(missing_ok=True)
+            raise DownloadError(
+                "Видео слишком большое для Telegram (лимит бота — 50 МБ). "
+                "Попробуйте другое видео или более короткое."
+            )
+        return DownloadResult(kind="video", title=title[:200], source=source, path=path)
 
-    title = (info.get("title") or "video").strip() or "video"
-    return DownloadedVideo(path=path, title=title[:200], source=_source_name(url))
+    # Если видео нет — пробуем TikTok-слайдшоу (фото).
+    photo_urls = _find_photos(info)
+    if photo_urls:
+        return DownloadResult(kind="photos", title=title[:200], source=source), photo_urls
 
-
-def _human_error(raw: str) -> str:
-    text = raw.lower()
-    if "private" in text or "login" in text or "sign in" in text:
-        return "Видео недоступно без авторизации или скрыто."
-    if "unavailable" in text or "not available" in text:
-        return "Видео недоступно. Проверьте ссылку."
-    if "copyright" in text or "removed" in text:
-        return "Видео удалено или заблокировано."
-    return "Не удалось скачать видео. Проверьте ссылку и попробуйте ещё раз."
+    raise DownloadError("Файл после скачивания не найден.")
 
 
-async def download_video(url: str) -> DownloadedVideo:
-    return await asyncio.to_thread(_download_sync, url, DOWNLOAD_DIR)
+async def _download_photos(urls: list[str], dest_dir: Path) -> list[Path]:
+    photos: list[Path] = []
+    async with aiohttp.ClientSession() as session:
+        for index, url in enumerate(urls, start=1):
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.read()
+                    if not data:
+                        continue
+                    ext = Path(url.split("?")[0]).suffix or mimetypes.guess_extension(
+                        resp.headers.get("Content-Type", "")
+                    ) or ".jpg"
+                    photo_path = dest_dir / f"{uuid.uuid4().hex}_{index}{ext}"
+                    photo_path.write_bytes(data)
+                    photos.append(photo_path)
+            except Exception:
+                continue
+    return photos
+
+
+async def download_video(url: str) -> DownloadResult:
+    result, photo_urls = await asyncio.to_thread(_download_sync, url, DOWNLOAD_DIR)
+    if result.kind == "photos" and photo_urls:
+        photos = await _download_photos(photo_urls, DOWNLOAD_DIR)
+        if not photos:
+            raise DownloadError("Не удалось скачать фото.")
+        result.photos = photos
+    return result

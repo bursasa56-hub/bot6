@@ -1,4 +1,9 @@
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.types import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+)
 
 from app.config import is_admin
 
@@ -69,6 +74,19 @@ def broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(text="✅ Отправить", callback_data="admin:bc_yes"),
                 InlineKeyboardButton(text="❌ Отмена", callback_data="admin:cancel"),
+            ]
+        ]
+    )
+
+
+def add_to_group_keyboard(bot_username: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="➕ Добавить бота в группу",
+                    url=f"https://t.me/{bot_username}?startgroup=true",
+                )
             ]
         ]
     )

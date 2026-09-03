@@ -6,6 +6,9 @@ import aiosqlite
 
 from app.config import DB_PATH
 
+CHAT_TYPE_USER = "user"
+CHAT_TYPE_GROUP = "group"
+
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -25,9 +28,28 @@ async def init_db() -> None:
                 username TEXT,
                 invite_link TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS broadcast_chats (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT NOT NULL DEFAULT 'user',
+                title TEXT,
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
             """
         )
+        await _seed_broadcast_chats(db)
         await db.commit()
+
+
+async def _seed_broadcast_chats(db: aiosqlite.Connection) -> None:
+    await db.execute(
+        """
+        INSERT INTO broadcast_chats (chat_id, chat_type, title)
+        SELECT user_id, 'user', COALESCE(username, full_name)
+        FROM users
+        WHERE user_id NOT IN (SELECT chat_id FROM broadcast_chats)
+        """
+    )
 
 
 async def upsert_user(user_id: int, username: str | None, full_name: str) -> None:
@@ -42,6 +64,37 @@ async def upsert_user(user_id: int, username: str | None, full_name: str) -> Non
             """,
             (user_id, username, full_name),
         )
+        await db.execute(
+            """
+            INSERT INTO broadcast_chats (chat_id, chat_type, title)
+            VALUES (?, 'user', ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                chat_type = excluded.chat_type,
+                title = excluded.title
+            """,
+            (user_id, CHAT_TYPE_USER, username or full_name),
+        )
+        await db.commit()
+
+
+async def upsert_group(chat_id: int, title: str | None) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO broadcast_chats (chat_id, chat_type, title)
+            VALUES (?, ?, ?)
+            ON CONFLICT(chat_id) DO UPDATE SET
+                chat_type = excluded.chat_type,
+                title = excluded.title
+            """,
+            (chat_id, CHAT_TYPE_GROUP, title),
+        )
+        await db.commit()
+
+
+async def remove_broadcast_chat(chat_id: int) -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM broadcast_chats WHERE chat_id = ?", (chat_id,))
         await db.commit()
 
 
@@ -52,9 +105,26 @@ async def count_users() -> int:
             return int(row[0]) if row else 0
 
 
+async def count_groups() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COUNT(*) FROM broadcast_chats WHERE chat_type = ?",
+            (CHAT_TYPE_GROUP,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return int(row[0]) if row else 0
+
+
 async def all_user_ids() -> list[int]:
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT user_id FROM users") as cursor:
+            rows = await cursor.fetchall()
+            return [int(row[0]) for row in rows]
+
+
+async def all_broadcast_chats() -> list[int]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT chat_id FROM broadcast_chats") as cursor:
             rows = await cursor.fetchall()
             return [int(row[0]) for row in rows]
 
