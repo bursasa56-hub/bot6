@@ -15,6 +15,4 @@ COPY run.py .
 ENV PYTHONUNBUFFERED=1
 ENV DATA_DIR=/data
 
-VOLUME ["/data"]
-
 CMD ["python", "run.py"]
